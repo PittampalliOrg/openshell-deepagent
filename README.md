@@ -69,7 +69,7 @@ The agent uses `write_file` to create scripts in `/sandbox/`, then the `execute`
    ```bash
    curl -LsSf https://astral.sh/uv/install.sh | sh
    ```
-3. **NVIDIA API key** — for the Nemotron model. Get one free at [integrate.api.nvidia.com](https://integrate.api.nvidia.com)
+3. **NVIDIA API key** — for the Nemotron model. Get one free at [build.nvidia.com](https://build.nvidia.com)
 
 ---
 
