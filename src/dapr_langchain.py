@@ -14,6 +14,27 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import ConfigDict, Field
 
 
+def _coerce_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                    continue
+            parts.append(json.dumps(item, sort_keys=True))
+        return "\n".join(part for part in parts if part)
+    if content is None:
+        return ""
+    return str(content)
+
+
 def _serialize_tool_call(tool_data: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": tool_data.get("id"),
@@ -27,18 +48,21 @@ def _serialize_tool_call(tool_data: dict[str, Any]) -> dict[str, Any]:
 
 def _message_to_dapr(message: BaseMessage) -> dict[str, Any]:
     if isinstance(message, HumanMessage):
-        return {"role": "user", "content": message.content}
+        return {"role": "user", "content": _coerce_message_content(message.content)}
     if isinstance(message, SystemMessage):
-        return {"role": "system", "content": message.content}
+        return {"role": "system", "content": _coerce_message_content(message.content)}
     if isinstance(message, ToolMessage):
         return {
             "role": "tool",
-            "content": message.content,
+            "content": _coerce_message_content(message.content),
             "tool_call_id": message.tool_call_id,
             "name": message.name,
         }
     if isinstance(message, AIMessage):
-        payload: dict[str, Any] = {"role": "assistant", "content": message.content}
+        payload: dict[str, Any] = {
+            "role": "assistant",
+            "content": _coerce_message_content(message.content),
+        }
         if message.tool_calls:
             payload["tool_calls"] = [_serialize_tool_call(call) for call in message.tool_calls]
         return payload
