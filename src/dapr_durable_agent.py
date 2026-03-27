@@ -65,6 +65,14 @@ class OpenShellDurableAgent(DurableAgent):
     """DurableAgent with automatic sandbox targeting and repo clone injection."""
 
     def agent_workflow(self, ctx, message: dict):
+        if not ctx.is_replaying:
+            logger.info(
+                "OpenShellDurableAgent.agent_workflow keys=%s sandboxName=%r repoUrl=%r repoBranch=%r",
+                sorted(message.keys()),
+                message.get("sandboxName"),
+                message.get("repoUrl"),
+                message.get("repoBranch"),
+            )
         sandbox_name = (message.get("sandboxName") or "").strip()
         repo_url = (message.get("repoUrl") or "").strip()
         repo_branch = (message.get("repoBranch") or "").strip()
