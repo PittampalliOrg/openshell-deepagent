@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime
 
 from dapr_agents import AgentRunner, DaprChatClient, DurableAgent
@@ -29,6 +30,36 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+# In-cluster Gitea URL for repos mirrored by function-router
+GITEA_INTERNAL_BASE = os.getenv(
+    "GITEA_INTERNAL_BASE_URL",
+    "http://gitea-http.gitea.svc.cluster.local:3000",
+)
+GITEA_CLONE_USER = os.getenv("GITEA_CLONE_USER", "giteaadmin")
+GITEA_CLONE_PASSWORD = os.getenv("GITEA_CLONE_PASSWORD", "developer")
+
+# Pattern: https://github.com/<owner>/<repo>[.git]
+_GITHUB_URL_RE = re.compile(
+    r"https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/.]+?)(?:\.git)?/?$"
+)
+
+
+def _rewrite_github_to_gitea(url: str) -> str:
+    """Rewrite a GitHub HTTPS URL to the in-cluster Gitea mirror.
+
+    Sandboxes can't reach github.com (SSL/network), but the function-router
+    mirrors repos into Gitea under ``giteaadmin/<repo>``.
+    """
+    m = _GITHUB_URL_RE.match(url)
+    if not m:
+        return url
+    repo = m.group("repo")
+    auth = f"{GITEA_CLONE_USER}:{GITEA_CLONE_PASSWORD}@" if GITEA_CLONE_PASSWORD else ""
+    base = GITEA_INTERNAL_BASE.rstrip("/")
+    if auth:
+        base = base.replace("://", f"://{auth}", 1)
+    return f"{base}/{GITEA_CLONE_USER}/{repo}.git"
+
 
 class OpenShellDurableAgent(DurableAgent):
     """DurableAgent with automatic sandbox targeting and repo clone injection."""
@@ -51,15 +82,16 @@ class OpenShellDurableAgent(DurableAgent):
         # Prepend clone instructions to the task
         if repo_url:
             task = message.get("task") or ""
-            clone_cmd = "git clone --depth 1"
-            if repo_branch:
-                clone_cmd += f" -b {repo_branch}"
-            if repo_token and repo_url.startswith("https://"):
+            # Rewrite GitHub URLs to in-cluster Gitea mirror
+            url = _rewrite_github_to_gitea(repo_url)
+            if url == repo_url and repo_token and repo_url.startswith("https://"):
+                # Not a GitHub URL but has token — inject auth
                 url = repo_url.replace(
                     "https://", f"https://oauth2:{repo_token}@", 1
                 )
-            else:
-                url = repo_url
+            clone_cmd = "git clone --depth 1"
+            if repo_branch:
+                clone_cmd += f" -b {repo_branch}"
             clone_cmd += f" {url} {sandbox_repo_path}"
 
             message = {**message, "task": (
