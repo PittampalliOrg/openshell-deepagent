@@ -47,7 +47,21 @@ class OpenShellRuntime:
             client = SandboxClient.from_active_cluster()
             configured_name = os.getenv(SANDBOX_NAME_ENV)
             if configured_name:
-                ref = client.get(configured_name)
+                try:
+                    ref = client.get(configured_name)
+                except Exception:
+                    # Sandbox doesn't exist yet — create a new one
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.info(
+                        "Sandbox %r not found, creating a new one", configured_name
+                    )
+                    ref = client.create()
+                    ref = client.wait_ready(ref.name)
+                    logger.info(
+                        "Created sandbox %r (requested %r)",
+                        ref.name, configured_name,
+                    )
             else:
                 ref = client.create()
                 ref = client.wait_ready(ref.name)
