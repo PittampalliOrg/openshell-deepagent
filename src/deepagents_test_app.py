@@ -8,6 +8,7 @@ from functools import lru_cache
 import asyncio
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 import dapr.ext.workflow as wf
@@ -18,12 +19,11 @@ from diagrid.agent.core.telemetry import instrument_grpc, setup_telemetry
 from diagrid.agent.deepagents import DaprWorkflowDeepAgentRunner
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from langchain_core.tools import tool as langchain_tool
 from opentelemetry import trace
 from pydantic import BaseModel, Field
 
 from src.dapr_langchain import DaprLangChainChatModel
-from src.openshell_runtime import get_runtime
-from src.openshell_tools import TOOLS
 from src.prompts import build_system_prompt
 
 DEFAULT_APP_PORT = 8002
@@ -36,6 +36,35 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+
+@langchain_tool
+def write_text_file(path: str, content: str) -> str:
+    """Write UTF-8 text to a local file path and create parent directories if needed."""
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return f"Wrote {len(content)} bytes to {target}"
+
+
+@langchain_tool
+def read_text_file(path: str) -> str:
+    """Read UTF-8 text from a local file path."""
+    target = Path(path).expanduser()
+    return target.read_text(encoding="utf-8")
+
+
+@langchain_tool
+def path_exists(path: str) -> bool:
+    """Return whether a local file path exists."""
+    return Path(path).expanduser().exists()
+
+
+BASELINE_TOOLS = [
+    write_text_file,
+    read_text_file,
+    path_exists,
+]
 
 
 class InvokeRequest(BaseModel):
@@ -127,7 +156,7 @@ def get_runner() -> DaprWorkflowDeepAgentRunner:
     )
     agent = create_deep_agent(
         model=model,
-        tools=TOOLS,
+        tools=BASELINE_TOOLS,
         system_prompt=build_system_prompt(current_date),
         name=DEEPAGENTS_NAME,
     )
@@ -154,8 +183,6 @@ async def _execute_deepagents_run(input_data: dict[str, Any]) -> dict[str, Any]:
         return {"success": False, "error": "task is required"}
 
     sandbox_name = str(input_data.get("sandboxName") or "").strip()
-    if sandbox_name:
-        get_runtime().set_sandbox_name(sandbox_name)
 
     thread_id = (
         str(input_data.get("threadId") or "").strip()
