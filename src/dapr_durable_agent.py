@@ -56,8 +56,8 @@ class OpenShellDurableAgent(DurableAgent):
                 os.environ["OPENSHELL_SANDBOX_NAME"] = sandbox_name
 
         # Prepend clone instructions to the task.
-        # OpenShell sandbox policy allows github.com:443 for git binaries.
-        # Use GIT_SSL_NO_VERIFY because sandbox doesn't have GitHub CA certs.
+        # After sandbox creation, apply a network policy that allows Gitea
+        # access so git clone can reach the in-cluster mirror.
         if repo_url:
             task = message.get("task") or ""
             url = repo_url

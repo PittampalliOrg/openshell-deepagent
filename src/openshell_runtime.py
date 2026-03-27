@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from textwrap import dedent
@@ -12,6 +13,58 @@ from openshell import SandboxClient, SandboxSession
 
 SANDBOX_NAME_ENV = "OPENSHELL_SANDBOX_NAME"
 DEFAULT_TIMEOUT_SECONDS = 30 * 60
+
+_logger = logging.getLogger(__name__)
+
+
+def _apply_gitea_network_policy(client: SandboxClient, sandbox_name: str) -> None:
+    """Hot-reload a network policy that adds Gitea internal access for git clone."""
+    try:
+        from openshell._proto import openshell_pb2, sandbox_pb2
+
+        gitea_host = os.getenv(
+            "GITEA_INTERNAL_HOST", "gitea-http.gitea.svc.cluster.local"
+        )
+        gitea_port = int(os.getenv("GITEA_INTERNAL_PORT", "3000"))
+
+        # Build a SandboxPolicy with a gitea_clone network policy
+        policy = sandbox_pb2.SandboxPolicy(
+            network_policies={
+                "gitea_clone": sandbox_pb2.NetworkPolicy(
+                    name="gitea-clone",
+                    endpoints=[
+                        sandbox_pb2.Endpoint(
+                            host=gitea_host,
+                            port=gitea_port,
+                        )
+                    ],
+                    binaries=[
+                        sandbox_pb2.Binary(path="/usr/bin/git"),
+                        sandbox_pb2.Binary(path="/usr/bin/curl"),
+                        sandbox_pb2.Binary(path="/bin/bash"),
+                    ],
+                )
+            }
+        )
+
+        response = client._stub.UpdateConfig(
+            openshell_pb2.UpdateConfigRequest(
+                name=sandbox_name,
+                policy=policy,
+            ),
+            timeout=30,
+        )
+        _logger.info(
+            "Applied gitea_clone network policy to sandbox %r (version=%s)",
+            sandbox_name,
+            response.version,
+        )
+    except Exception as exc:
+        _logger.warning(
+            "Failed to apply gitea_clone network policy to %r: %s",
+            sandbox_name,
+            exc,
+        )
 
 
 def _merge_output(stdout: str, stderr: str) -> str:
@@ -51,16 +104,15 @@ class OpenShellRuntime:
                     ref = client.get(configured_name)
                 except Exception:
                     # Sandbox doesn't exist yet — create a new one
-                    import logging
-                    _log = logging.getLogger(__name__)
-                    _log.info(
+                    _logger.info(
                         "Sandbox %r not found, creating a new one", configured_name
                     )
                     ref = client.create()
                     ref = client.wait_ready(ref.name)
                     # Update env var so subsequent calls reuse this sandbox
                     os.environ[SANDBOX_NAME_ENV] = ref.name
-                    _log.info(
+                    _apply_gitea_network_policy(client, ref.name)
+                    _logger.info(
                         "Created sandbox %r (requested %r)",
                         ref.name, configured_name,
                     )
@@ -68,6 +120,7 @@ class OpenShellRuntime:
                 ref = client.create()
                 ref = client.wait_ready(ref.name)
                 os.environ[SANDBOX_NAME_ENV] = ref.name
+                _apply_gitea_network_policy(client, ref.name)
 
             self._sandbox_name = ref.name
             self._session = SandboxSession(client, ref)
