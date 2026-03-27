@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from datetime import datetime
 
 from dapr_agents import AgentRunner, DaprChatClient, DurableAgent
@@ -29,41 +28,6 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
 load_dotenv()
-
-# In-cluster Gitea URL for repos mirrored by function-router.
-# Use token auth (oauth2:<token>@) — basic auth (user:pass@) triggers 403 from
-# git-http-backend when the sandbox's HTTP client doesn't send credentials on
-# the initial challenge-less request.
-GITEA_INTERNAL_BASE = os.getenv(
-    "GITEA_INTERNAL_BASE_URL",
-    "http://gitea-http.gitea.svc.cluster.local:3000",
-)
-GITEA_CLONE_OWNER = os.getenv("GITEA_CLONE_OWNER", "giteaadmin")
-GITEA_CLONE_TOKEN = os.getenv(
-    "GITEA_CLONE_TOKEN", "22aa40ad26e328745563fd5c838a3b227c980a07"
-)
-
-# Pattern: https://github.com/<owner>/<repo>[.git]
-_GITHUB_URL_RE = re.compile(
-    r"https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/.]+?)(?:\.git)?/?$"
-)
-
-
-def _rewrite_github_to_gitea(url: str) -> str:
-    """Rewrite a GitHub HTTPS URL to the in-cluster Gitea mirror.
-
-    Sandboxes can't reach github.com (SSL/network), but the function-router
-    mirrors repos into Gitea under ``giteaadmin/<repo>``.
-    """
-    m = _GITHUB_URL_RE.match(url)
-    if not m:
-        return url
-    repo = m.group("repo")
-    base = GITEA_INTERNAL_BASE.rstrip("/")
-    if GITEA_CLONE_TOKEN:
-        base = base.replace("://", f"://oauth2:{GITEA_CLONE_TOKEN}@", 1)
-    return f"{base}/{GITEA_CLONE_OWNER}/{repo}.git"
-
 
 class OpenShellDurableAgent(DurableAgent):
     """DurableAgent with automatic sandbox targeting and repo clone injection."""
@@ -91,17 +55,15 @@ class OpenShellDurableAgent(DurableAgent):
             if not current:
                 os.environ["OPENSHELL_SANDBOX_NAME"] = sandbox_name
 
-        # Prepend clone instructions to the task
+        # Prepend clone instructions to the task.
+        # OpenShell sandbox policy allows github.com:443 for git binaries.
+        # Use GIT_SSL_NO_VERIFY because sandbox doesn't have GitHub CA certs.
         if repo_url:
             task = message.get("task") or ""
-            # Rewrite GitHub URLs to in-cluster Gitea mirror
-            url = _rewrite_github_to_gitea(repo_url)
-            if url == repo_url and repo_token and repo_url.startswith("https://"):
-                # Not a GitHub URL but has token — inject auth
-                url = repo_url.replace(
-                    "https://", f"https://oauth2:{repo_token}@", 1
-                )
-            clone_cmd = "git clone --depth 1"
+            url = repo_url
+            if repo_token and url.startswith("https://"):
+                url = url.replace("https://", f"https://oauth2:{repo_token}@", 1)
+            clone_cmd = "GIT_SSL_NO_VERIFY=true git clone --depth 1"
             if repo_branch:
                 clone_cmd += f" -b {repo_branch}"
             clone_cmd += f" {url} {sandbox_repo_path}"
