@@ -14,6 +14,7 @@ from typing import Any
 import dapr.ext.workflow as wf
 from dapr.ext.workflow import DaprWorkflowContext, WorkflowActivityContext
 from dapr_agents import DaprChatClient
+from dapr_agents.tool.utils.tool import ToolHelper
 from deepagents import create_deep_agent
 from diagrid.agent.core.telemetry import instrument_grpc, setup_telemetry
 from diagrid.agent.deepagents import DaprWorkflowDeepAgentRunner
@@ -36,6 +37,37 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+
+def _patch_dapr_tool_format_bug() -> None:
+    """Normalize dict-based Dapr tool schemas to the OpenAI-compatible format.
+
+    `dapr_agents` already aliases callable tools from `dapr` to `openai`, but the
+    dict validation path still rejects `tool_format="dapr"`. The Diagrid runner
+    feeds LangChain-bound dict tools into that path, so patch it locally for the
+    baseline until the upstream package is fixed.
+    """
+
+    current = ToolHelper.format_tool
+    if getattr(current, "__name__", "") == "_patched_format_tool":
+        return
+
+    def _patched_format_tool(
+        tool: dict[str, Any] | Any,
+        tool_format: str = "openai",
+        use_deprecated: bool = False,
+    ) -> dict[str, Any]:
+        normalized_format = (
+            "openai" if str(tool_format).lower() == "dapr" else tool_format
+        )
+        return current(
+            tool,
+            tool_format=normalized_format,
+            use_deprecated=use_deprecated,
+        )
+
+    ToolHelper.format_tool = staticmethod(_patched_format_tool)
+    logger.info("Patched ToolHelper.format_tool to normalize Dapr dict tools")
 
 
 @langchain_tool
@@ -147,6 +179,7 @@ def _build_messages(input_data: dict[str, Any]) -> list[tuple[str, str]]:
 @lru_cache(maxsize=1)
 def get_runner() -> DaprWorkflowDeepAgentRunner:
     """Create and configure the shared DeepAgents runner."""
+    _patch_dapr_tool_format_bug()
     current_date = datetime.now().strftime("%Y-%m-%d")
     llm_component = os.getenv("DAPR_LLM_COMPONENT", DEFAULT_LLM_COMPONENT)
     max_steps = int(os.getenv("DEEPAGENTS_MAX_STEPS", "100"))
