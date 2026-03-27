@@ -30,13 +30,18 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# In-cluster Gitea URL for repos mirrored by function-router
+# In-cluster Gitea URL for repos mirrored by function-router.
+# Use token auth (oauth2:<token>@) — basic auth (user:pass@) triggers 403 from
+# git-http-backend when the sandbox's HTTP client doesn't send credentials on
+# the initial challenge-less request.
 GITEA_INTERNAL_BASE = os.getenv(
     "GITEA_INTERNAL_BASE_URL",
     "http://gitea-http.gitea.svc.cluster.local:3000",
 )
-GITEA_CLONE_USER = os.getenv("GITEA_CLONE_USER", "giteaadmin")
-GITEA_CLONE_PASSWORD = os.getenv("GITEA_CLONE_PASSWORD", "developer")
+GITEA_CLONE_OWNER = os.getenv("GITEA_CLONE_OWNER", "giteaadmin")
+GITEA_CLONE_TOKEN = os.getenv(
+    "GITEA_CLONE_TOKEN", "22aa40ad26e328745563fd5c838a3b227c980a07"
+)
 
 # Pattern: https://github.com/<owner>/<repo>[.git]
 _GITHUB_URL_RE = re.compile(
@@ -54,11 +59,10 @@ def _rewrite_github_to_gitea(url: str) -> str:
     if not m:
         return url
     repo = m.group("repo")
-    auth = f"{GITEA_CLONE_USER}:{GITEA_CLONE_PASSWORD}@" if GITEA_CLONE_PASSWORD else ""
     base = GITEA_INTERNAL_BASE.rstrip("/")
-    if auth:
-        base = base.replace("://", f"://{auth}", 1)
-    return f"{base}/{GITEA_CLONE_USER}/{repo}.git"
+    if GITEA_CLONE_TOKEN:
+        base = base.replace("://", f"://oauth2:{GITEA_CLONE_TOKEN}@", 1)
+    return f"{base}/{GITEA_CLONE_OWNER}/{repo}.git"
 
 
 class OpenShellDurableAgent(DurableAgent):
