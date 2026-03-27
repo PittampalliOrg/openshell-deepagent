@@ -33,7 +33,7 @@ class OpenShellRuntime:
         if self._sandbox_name != name:
             with self._lock:
                 self._session = None
-                self._sandbox_name = None
+                self._sandbox_name = name
             os.environ[SANDBOX_NAME_ENV] = name
 
     def _ensure_session(self) -> SandboxSession:
@@ -52,19 +52,22 @@ class OpenShellRuntime:
                 except Exception:
                     # Sandbox doesn't exist yet — create a new one
                     import logging
-                    logger = logging.getLogger(__name__)
-                    logger.info(
+                    _log = logging.getLogger(__name__)
+                    _log.info(
                         "Sandbox %r not found, creating a new one", configured_name
                     )
                     ref = client.create()
                     ref = client.wait_ready(ref.name)
-                    logger.info(
+                    # Update env var so subsequent calls reuse this sandbox
+                    os.environ[SANDBOX_NAME_ENV] = ref.name
+                    _log.info(
                         "Created sandbox %r (requested %r)",
                         ref.name, configured_name,
                     )
             else:
                 ref = client.create()
                 ref = client.wait_ready(ref.name)
+                os.environ[SANDBOX_NAME_ENV] = ref.name
 
             self._sandbox_name = ref.name
             self._session = SandboxSession(client, ref)

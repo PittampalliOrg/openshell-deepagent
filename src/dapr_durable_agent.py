@@ -40,10 +40,13 @@ class OpenShellDurableAgent(DurableAgent):
         repo_token = (message.get("repoToken") or "").strip()
         sandbox_repo_path = (message.get("sandboxRepoPath") or "/sandbox/repo").strip()
 
-        # Target the orchestrator-assigned sandbox
+        # Target the orchestrator-assigned sandbox (only set env var if not
+        # already pointing to a real sandbox — avoids resetting the session
+        # on Dapr workflow replays after a sandbox was already created).
         if sandbox_name:
-            os.environ["OPENSHELL_SANDBOX_NAME"] = sandbox_name
-            get_runtime().set_sandbox_name(sandbox_name)
+            current = os.environ.get("OPENSHELL_SANDBOX_NAME", "")
+            if not current:
+                os.environ["OPENSHELL_SANDBOX_NAME"] = sandbox_name
 
         # Prepend clone instructions to the task
         if repo_url:
