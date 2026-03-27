@@ -10,6 +10,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 import dapr.ext.workflow as wf
 from dapr.ext.workflow import DaprWorkflowContext, WorkflowActivityContext
@@ -22,7 +23,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from langchain_core.tools import tool as langchain_tool
 from opentelemetry import trace
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.dapr_langchain import DaprLangChainChatModel
 from src.prompts import build_system_prompt
@@ -102,14 +103,39 @@ BASELINE_TOOLS = [
 class InvokeRequest(BaseModel):
     """Workflow input accepted by the baseline service."""
 
-    task: str = Field(..., description="User task for the baseline agent")
+    model_config = ConfigDict(extra="allow")
+
+    task: str | None = Field(
+        None, description="User task for the baseline agent"
+    )
+    prompt: str | None = Field(
+        None, description="Workflow-builder prompt alias"
+    )
+    goal: str | None = Field(
+        None, description="Legacy goal alias for task"
+    )
     threadId: str | None = Field(
         None, description="Conversation thread identifier"
     )
+    executionId: str | None = Field(
+        None, description="Per-run execution identifier"
+    )
+    dbExecutionId: str | None = Field(
+        None, description="Database execution identifier"
+    )
     sandboxName: str | None = Field(None, description="OpenShell sandbox name")
     repoUrl: str | None = Field(None, description="Git repository URL to clone")
+    repositoryUrl: str | None = Field(
+        None, description="Workflow-builder repository URL alias"
+    )
     repoBranch: str | None = Field(None, description="Git branch to checkout")
+    repositoryBranch: str | None = Field(
+        None, description="Workflow-builder repository branch alias"
+    )
     repoToken: str | None = Field(None, description="Git auth token")
+    repositoryToken: str | None = Field(
+        None, description="Workflow-builder repository auth token alias"
+    )
     provider: str | None = Field(None, description="Preferred provider label")
     model: str | None = Field(None, description="Preferred model identifier")
     mode: str | None = Field(None, description="Workflow-builder mode label")
@@ -153,13 +179,53 @@ def _current_trace_id() -> str | None:
     return f"{span_context.trace_id:032x}"
 
 
+def _first_nonempty(input_data: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = input_data.get(key)
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if trimmed:
+                return trimmed
+    return ""
+
+
+def _normalize_diagrid_otlp_env() -> None:
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    if not endpoint:
+        return
+
+    normalized_endpoint = endpoint
+    parsed = urlparse(endpoint)
+    if parsed.port == 4318:
+        normalized_endpoint = urlunparse(
+            parsed._replace(netloc=f"{parsed.hostname}:4317", path="")
+        )
+
+    if normalized_endpoint != endpoint:
+        logger.info(
+            "Normalized OTLP endpoint for Diagrid gRPC exporter: %s -> %s",
+            endpoint,
+            normalized_endpoint,
+        )
+        os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = normalized_endpoint
+
+    protocol = os.getenv("OTEL_EXPORTER_OTLP_PROTOCOL", "").strip().lower()
+    if protocol == "http/protobuf":
+        os.environ.pop("OTEL_EXPORTER_OTLP_PROTOCOL", None)
+        logger.info("Removed OTLP HTTP protocol override for Diagrid gRPC exporter")
+
+
+def _resolve_task(input_data: dict[str, Any]) -> str:
+    return _first_nonempty(input_data, "task", "prompt", "goal")
+
+
 def _build_messages(input_data: dict[str, Any]) -> list[tuple[str, str]]:
     messages: list[tuple[str, str]] = []
-    repo_url = str(input_data.get("repoUrl") or "").strip()
+    repo_url = _first_nonempty(input_data, "repoUrl", "repositoryUrl")
     if repo_url:
         clone_cmd = "git clone"
-        repo_branch = str(input_data.get("repoBranch") or "").strip()
-        repo_token = str(input_data.get("repoToken") or "").strip()
+        repo_branch = _first_nonempty(input_data, "repoBranch", "repositoryBranch")
+        repo_token = _first_nonempty(input_data, "repoToken", "repositoryToken")
         if repo_branch:
             clone_cmd += f" -b {repo_branch}"
         if repo_token and repo_url.startswith("https://"):
@@ -172,7 +238,7 @@ def _build_messages(input_data: dict[str, Any]) -> list[tuple[str, str]]:
         messages.append(
             ("system", f"Before starting, clone the repository: {clone_cmd}")
         )
-    messages.append(("user", str(input_data.get("task") or "").strip()))
+    messages.append(("user", _resolve_task(input_data)))
     return messages
 
 
@@ -211,7 +277,7 @@ def get_runner() -> DaprWorkflowDeepAgentRunner:
 
 async def _execute_deepagents_run(input_data: dict[str, Any]) -> dict[str, Any]:
     """Execute a single DeepAgents run and adapt it to workflow-builder output."""
-    task = str(input_data.get("task") or "").strip()
+    task = _resolve_task(input_data)
     if not task:
         return {"success": False, "error": "task is required"}
 
@@ -219,18 +285,26 @@ async def _execute_deepagents_run(input_data: dict[str, Any]) -> dict[str, Any]:
 
     thread_id = (
         str(input_data.get("threadId") or "").strip()
+        or str(input_data.get("executionId") or "").strip()
+        or str(input_data.get("dbExecutionId") or "").strip()
         or str(input_data.get("executionThreadId") or "").strip()
         or str(input_data.get("planningThreadId") or "").strip()
         or str(input_data.get("workflowId") or "").strip()
         or "openshell-deepagents-test"
     )
-    workflow_root = str(input_data.get("workflowId") or "").strip() or thread_id
+    workflow_root = (
+        str(input_data.get("executionId") or "").strip()
+        or str(input_data.get("dbExecutionId") or "").strip()
+        or str(input_data.get("workflowId") or "").strip()
+        or thread_id
+    )
     nested_workflow_id = f"{workflow_root}__deepagents"
     timeout_minutes = int(input_data.get("timeoutMinutes") or 30)
 
     runner = get_runner()
     completion_event: dict[str, Any] | None = None
     failure_event: dict[str, Any] | None = None
+    trace_id: str | None = None
 
     async def _collect() -> None:
         nonlocal completion_event, failure_event
@@ -248,9 +322,21 @@ async def _execute_deepagents_run(input_data: dict[str, Any]) -> dict[str, Any]:
                 failure_event = event
                 return
 
+    tracer = trace.get_tracer(DEEPAGENTS_NAME)
     try:
-        await asyncio.wait_for(_collect(), timeout=timeout_minutes * 60)
-    except TimeoutError:
+        with tracer.start_as_current_span(
+            f"invoke_agent {DEEPAGENTS_NAME}",
+            attributes={
+                "agent.name": DEEPAGENTS_NAME,
+                "workflow.instance_id": nested_workflow_id,
+                "workflow.id": str(input_data.get("workflowId") or ""),
+                "workflow.execution_id": str(input_data.get("executionId") or ""),
+                "sandbox.name": sandbox_name,
+            },
+        ):
+            trace_id = _current_trace_id()
+            await asyncio.wait_for(_collect(), timeout=timeout_minutes * 60)
+    except asyncio.TimeoutError:
         return {
             "success": False,
             "error": f"DeepAgents baseline timed out after {timeout_minutes} minutes",
@@ -258,7 +344,18 @@ async def _execute_deepagents_run(input_data: dict[str, Any]) -> dict[str, Any]:
             "daprInstanceId": nested_workflow_id,
             "sandboxName": sandbox_name or None,
             "provider": input_data.get("provider"),
-            "traceId": _current_trace_id(),
+            "traceId": trace_id,
+        }
+    except Exception as exc:
+        logger.exception("DeepAgents baseline run failed")
+        return {
+            "success": False,
+            "error": str(exc),
+            "agentWorkflowId": nested_workflow_id,
+            "daprInstanceId": nested_workflow_id,
+            "sandboxName": sandbox_name or None,
+            "provider": input_data.get("provider"),
+            "traceId": trace_id,
         }
 
     if failure_event is not None:
@@ -272,7 +369,7 @@ async def _execute_deepagents_run(input_data: dict[str, Any]) -> dict[str, Any]:
             "daprInstanceId": nested_workflow_id,
             "sandboxName": sandbox_name or None,
             "provider": input_data.get("provider"),
-            "traceId": _current_trace_id(),
+            "traceId": trace_id,
         }
 
     output = (
@@ -290,7 +387,6 @@ async def _execute_deepagents_run(input_data: dict[str, Any]) -> dict[str, Any]:
     elif last_message is not None:
         final_text = str(getattr(last_message, "content", last_message) or "").strip()
 
-    trace_id = _current_trace_id()
     updated_at = datetime.now().isoformat()
 
     return {
@@ -361,6 +457,7 @@ def openshell_deepagents_test_workflow(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    _normalize_diagrid_otlp_env()
     setup_telemetry(DEEPAGENTS_NAME)
     instrument_grpc()
     runner = get_runner()
