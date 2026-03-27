@@ -21,3 +21,8 @@ FROM base AS langgraph-dapr
 ENV APP_PORT=8001
 EXPOSE 8001
 CMD ["python", "-m", "src.langgraph_dapr_app"]
+
+FROM base AS deepagents-test
+ENV APP_PORT=8002
+EXPOSE 8002
+CMD ["python", "-m", "src.deepagents_test_app"]

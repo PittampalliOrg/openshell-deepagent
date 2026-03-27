@@ -1,0 +1,355 @@
+"""Diagrid DeepAgents baseline service for OpenShell observability testing."""
+
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from datetime import datetime
+from functools import lru_cache
+import asyncio
+import logging
+import os
+from typing import Any
+
+import dapr.ext.workflow as wf
+from dapr.ext.workflow import DaprWorkflowContext, WorkflowActivityContext
+from dapr_agents import DaprChatClient
+from deepagents import create_deep_agent
+from diagrid.agent.core.telemetry import instrument_grpc, setup_telemetry
+from diagrid.agent.deepagents import DaprWorkflowDeepAgentRunner
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from opentelemetry import trace
+from pydantic import BaseModel, Field
+
+from src.dapr_langchain import DaprLangChainChatModel
+from src.openshell_runtime import get_runtime
+from src.openshell_tools import TOOLS
+from src.prompts import build_system_prompt
+
+DEFAULT_APP_PORT = 8002
+DEFAULT_LLM_COMPONENT = "llm-provider"
+DEEPAGENTS_NAME = "openshell-deepagents-test"
+DEEPAGENTS_WORKFLOW_NAME = "dapr.agents.OpenShellDeepagentsTest.workflow"
+DEEPAGENTS_ACTIVITY_NAME = "run_openshell_deepagents_test_activity"
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+
+class InvokeRequest(BaseModel):
+    """Workflow input accepted by the baseline service."""
+
+    task: str = Field(..., description="User task for the baseline agent")
+    threadId: str | None = Field(
+        None, description="Conversation thread identifier"
+    )
+    sandboxName: str | None = Field(None, description="OpenShell sandbox name")
+    repoUrl: str | None = Field(None, description="Git repository URL to clone")
+    repoBranch: str | None = Field(None, description="Git branch to checkout")
+    repoToken: str | None = Field(None, description="Git auth token")
+    provider: str | None = Field(None, description="Preferred provider label")
+    model: str | None = Field(None, description="Preferred model identifier")
+    mode: str | None = Field(None, description="Workflow-builder mode label")
+    workflowId: str | None = Field(
+        None, description="Optional wrapper workflow instance identifier"
+    )
+    planningThreadId: str | None = Field(
+        None, description="Planning thread identifier"
+    )
+    executionThreadId: str | None = Field(
+        None, description="Execution thread identifier"
+    )
+    timeoutMinutes: int = Field(30, description="Max execution time in minutes")
+    traceId: str | None = Field(None, description="Parent trace identifier")
+
+
+def _serialize_message(message: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": getattr(message, "type", "unknown"),
+        "content": getattr(message, "content", ""),
+    }
+    tool_calls = getattr(message, "tool_calls", None)
+    if tool_calls:
+        payload["tool_calls"] = tool_calls
+    tool_call_id = getattr(message, "tool_call_id", None)
+    if tool_call_id:
+        payload["tool_call_id"] = tool_call_id
+    name = getattr(message, "name", None)
+    if name:
+        payload["name"] = name
+    return payload
+
+
+def _current_trace_id() -> str | None:
+    span = trace.get_current_span()
+    if span is None:
+        return None
+    span_context = span.get_span_context()
+    if not span_context or not span_context.is_valid:
+        return None
+    return f"{span_context.trace_id:032x}"
+
+
+def _build_messages(input_data: dict[str, Any]) -> list[tuple[str, str]]:
+    messages: list[tuple[str, str]] = []
+    repo_url = str(input_data.get("repoUrl") or "").strip()
+    if repo_url:
+        clone_cmd = "git clone"
+        repo_branch = str(input_data.get("repoBranch") or "").strip()
+        repo_token = str(input_data.get("repoToken") or "").strip()
+        if repo_branch:
+            clone_cmd += f" -b {repo_branch}"
+        if repo_token and repo_url.startswith("https://"):
+            clone_url = repo_url.replace(
+                "https://", f"https://oauth2:{repo_token}@", 1
+            )
+        else:
+            clone_url = repo_url
+        clone_cmd += f" {clone_url} /sandbox/repo"
+        messages.append(
+            ("system", f"Before starting, clone the repository: {clone_cmd}")
+        )
+    messages.append(("user", str(input_data.get("task") or "").strip()))
+    return messages
+
+
+@lru_cache(maxsize=1)
+def get_runner() -> DaprWorkflowDeepAgentRunner:
+    """Create and configure the shared DeepAgents runner."""
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    llm_component = os.getenv("DAPR_LLM_COMPONENT", DEFAULT_LLM_COMPONENT)
+    max_steps = int(os.getenv("DEEPAGENTS_MAX_STEPS", "100"))
+
+    model = DaprLangChainChatModel(
+        client=DaprChatClient(component_name=llm_component),
+    )
+    agent = create_deep_agent(
+        model=model,
+        tools=TOOLS,
+        system_prompt=build_system_prompt(current_date),
+        name=DEEPAGENTS_NAME,
+    )
+    runner = DaprWorkflowDeepAgentRunner(
+        agent=agent,
+        name=DEEPAGENTS_NAME,
+        max_steps=max_steps,
+    )
+    runner._workflow_runtime.register_workflow(
+        openshell_deepagents_test_workflow,
+        name=DEEPAGENTS_WORKFLOW_NAME,
+    )
+    runner._workflow_runtime.register_activity(
+        run_openshell_deepagents_test_activity,
+        name=DEEPAGENTS_ACTIVITY_NAME,
+    )
+    return runner
+
+
+async def _execute_deepagents_run(input_data: dict[str, Any]) -> dict[str, Any]:
+    """Execute a single DeepAgents run and adapt it to workflow-builder output."""
+    task = str(input_data.get("task") or "").strip()
+    if not task:
+        return {"success": False, "error": "task is required"}
+
+    sandbox_name = str(input_data.get("sandboxName") or "").strip()
+    if sandbox_name:
+        get_runtime().set_sandbox_name(sandbox_name)
+
+    thread_id = (
+        str(input_data.get("threadId") or "").strip()
+        or str(input_data.get("executionThreadId") or "").strip()
+        or str(input_data.get("planningThreadId") or "").strip()
+        or str(input_data.get("workflowId") or "").strip()
+        or "openshell-deepagents-test"
+    )
+    workflow_root = str(input_data.get("workflowId") or "").strip() or thread_id
+    nested_workflow_id = f"{workflow_root}__deepagents"
+    timeout_minutes = int(input_data.get("timeoutMinutes") or 30)
+
+    runner = get_runner()
+    completion_event: dict[str, Any] | None = None
+    failure_event: dict[str, Any] | None = None
+
+    async def _collect() -> None:
+        nonlocal completion_event, failure_event
+        async for event in runner.run_async(
+            input={"messages": _build_messages(input_data)},
+            thread_id=thread_id,
+            workflow_id=nested_workflow_id,
+            config={"thread_id": thread_id},
+        ):
+            event_type = str(event.get("type") or "").strip()
+            if event_type == "workflow_completed":
+                completion_event = event
+                return
+            if event_type in {"workflow_failed", "workflow_error", "workflow_terminated"}:
+                failure_event = event
+                return
+
+    try:
+        await asyncio.wait_for(_collect(), timeout=timeout_minutes * 60)
+    except TimeoutError:
+        return {
+            "success": False,
+            "error": f"DeepAgents baseline timed out after {timeout_minutes} minutes",
+            "agentWorkflowId": nested_workflow_id,
+            "daprInstanceId": nested_workflow_id,
+            "sandboxName": sandbox_name or None,
+            "provider": input_data.get("provider"),
+            "traceId": _current_trace_id(),
+        }
+
+    if failure_event is not None:
+        error = failure_event.get("error")
+        if isinstance(error, dict):
+            error = error.get("message") or error.get("error_type") or str(error)
+        return {
+            "success": False,
+            "error": str(error or "DeepAgents workflow failed"),
+            "agentWorkflowId": nested_workflow_id,
+            "daprInstanceId": nested_workflow_id,
+            "sandboxName": sandbox_name or None,
+            "provider": input_data.get("provider"),
+            "traceId": _current_trace_id(),
+        }
+
+    output = (
+        completion_event.get("output")
+        if isinstance(completion_event, dict)
+        else None
+    )
+    if not isinstance(output, dict):
+        output = {}
+    messages = output.get("messages")
+    last_message = messages[-1] if isinstance(messages, list) and messages else None
+    final_text = ""
+    if isinstance(last_message, dict):
+        final_text = str(last_message.get("content") or "").strip()
+    elif last_message is not None:
+        final_text = str(getattr(last_message, "content", last_message) or "").strip()
+
+    trace_id = _current_trace_id()
+    updated_at = datetime.now().isoformat()
+
+    return {
+        "success": True,
+        "content": final_text,
+        "text": final_text,
+        "final_answer": final_text,
+        "assistantMessage": (
+            _serialize_message(last_message) if last_message is not None else None
+        ),
+        "messages": [
+            _serialize_message(message) if not isinstance(message, dict) else message
+            for message in messages
+        ]
+        if isinstance(messages, list)
+        else [],
+        "traceId": trace_id,
+        "agentProgress": {
+            "status": "completed",
+            "phase": str(input_data.get("mode") or "execute_direct"),
+            "summary": final_text or None,
+            "currentStepName": sandbox_name or None,
+            "activeToolName": None,
+            "stopReason": "workflow completed",
+            "agentWorkflowId": nested_workflow_id,
+            "daprInstanceId": nested_workflow_id,
+            "traceId": trace_id,
+            "updatedAt": updated_at,
+            "recentTurns": [],
+        },
+        "agentWorkflowId": nested_workflow_id,
+        "daprInstanceId": nested_workflow_id,
+        "sandboxName": sandbox_name or None,
+        "provider": input_data.get("provider"),
+        "threadId": thread_id,
+        "planningThreadId": input_data.get("planningThreadId"),
+        "executionThreadId": input_data.get("executionThreadId"),
+    }
+
+
+def run_openshell_deepagents_test_activity(
+    ctx: WorkflowActivityContext,
+    input_data: dict[str, Any],
+) -> dict[str, Any]:
+    """Activity wrapper used by the simple native child workflow."""
+    del ctx
+    timeout_minutes = int(input_data.get("timeoutMinutes") or 30)
+    runner = get_runner()
+    return runner._run_sync(
+        _execute_deepagents_run(input_data),
+        timeout=max(timeout_minutes * 60 + 30, 300.0),
+    )
+
+
+def openshell_deepagents_test_workflow(
+    ctx: DaprWorkflowContext,
+    input_data: dict[str, Any],
+) -> dict[str, Any]:
+    """Simple workflow-builder compatible wrapper over the Diagrid runner."""
+    workflow_input = dict(input_data or {})
+    workflow_input["workflowId"] = getattr(ctx, "instance_id", None)
+    result = yield ctx.call_activity(
+        run_openshell_deepagents_test_activity,
+        input=workflow_input,
+    )
+    return result
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    setup_telemetry(DEEPAGENTS_NAME)
+    instrument_grpc()
+    runner = get_runner()
+    runner.start()
+    try:
+        yield
+    finally:
+        runner.shutdown()
+
+
+app = FastAPI(
+    title="OpenShell DeepAgents Baseline",
+    lifespan=lifespan,
+)
+
+
+@app.get("/healthz")
+def healthz() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/invoke")
+async def invoke(request: InvokeRequest) -> dict[str, Any]:
+    return await _execute_deepagents_run(request.model_dump())
+
+
+@app.post("/api/run")
+async def run_api(request: InvokeRequest) -> dict[str, Any]:
+    return await _execute_deepagents_run(request.model_dump())
+
+
+@app.get("/api/run/{workflow_id}")
+def get_status(workflow_id: str) -> dict[str, Any]:
+    status = get_runner().get_workflow_status(workflow_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return status
+
+
+def main() -> None:
+    """Run the baseline service with uvicorn."""
+    import uvicorn
+
+    uvicorn.run(
+        "src.deepagents_test_app:app",
+        host="0.0.0.0",
+        port=int(os.getenv("APP_PORT", str(DEFAULT_APP_PORT))),
+    )
+
+
+if __name__ == "__main__":
+    main()

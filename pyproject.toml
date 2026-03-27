@@ -4,8 +4,10 @@ version = "0.1.0"
 description = "OpenShell agent with native Dapr durable-agent and LangGraph+Dapr runtimes"
 requires-python = ">=3.12"
 dependencies = [
+    "deepagents==0.4.12",
     "dapr-agents==1.0.0",
     "dapr-ext-langgraph==1.17.3",
+    "diagrid[deepagents]==0.2.4",
     "langchain>=1.2.12",
     "langgraph>=1.0.3",
     "openshell>=0.0.7",
