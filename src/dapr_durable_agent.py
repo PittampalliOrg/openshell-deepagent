@@ -9,14 +9,13 @@ from datetime import datetime
 from dapr_agents import AgentRunner, DaprChatClient, DurableAgent
 from dapr_agents.agents.configs import (
     AgentMemoryConfig,
-    AgentObservabilityConfig,
     AgentStateConfig,
-    AgentTracingExporter,
 )
 from dapr_agents.memory import ConversationDaprStateMemory
 from dapr_agents.storage.daprstores.stateservice import StateStoreService
 from dotenv import load_dotenv
 
+from src.openshell_runtime import get_runtime
 from src.openshell_tools import DURABLE_TOOLS
 from src.prompts import build_system_prompt
 
@@ -31,7 +30,45 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 
-def create_durable_agent() -> DurableAgent:
+class OpenShellDurableAgent(DurableAgent):
+    """DurableAgent with automatic sandbox targeting and repo clone injection."""
+
+    def agent_workflow(self, ctx, message: dict):
+        sandbox_name = (message.get("sandboxName") or "").strip()
+        repo_url = (message.get("repoUrl") or "").strip()
+        repo_branch = (message.get("repoBranch") or "").strip()
+        repo_token = (message.get("repoToken") or "").strip()
+        sandbox_repo_path = (message.get("sandboxRepoPath") or "/sandbox/repo").strip()
+
+        # Target the orchestrator-assigned sandbox
+        if sandbox_name:
+            os.environ["OPENSHELL_SANDBOX_NAME"] = sandbox_name
+            get_runtime().set_sandbox_name(sandbox_name)
+
+        # Prepend clone instructions to the task
+        if repo_url:
+            task = message.get("task") or ""
+            clone_cmd = "git clone --depth 1"
+            if repo_branch:
+                clone_cmd += f" -b {repo_branch}"
+            if repo_token and repo_url.startswith("https://"):
+                url = repo_url.replace(
+                    "https://", f"https://oauth2:{repo_token}@", 1
+                )
+            else:
+                url = repo_url
+            clone_cmd += f" {url} {sandbox_repo_path}"
+
+            message = {**message, "task": (
+                f"SETUP: First, clone the repository:\n"
+                f"  {clone_cmd}\n"
+                f"Then cd into {sandbox_repo_path} and proceed with:\n\n{task}"
+            )}
+
+        yield from super().agent_workflow(ctx, message)
+
+
+def create_durable_agent() -> OpenShellDurableAgent:
     """Create the native Dapr DurableAgent instance."""
     current_date = datetime.now().strftime("%Y-%m-%d")
     agent_name = os.getenv("AGENT_NAME", "OpenShellDeepAgent")
@@ -39,23 +76,17 @@ def create_durable_agent() -> DurableAgent:
     memory_store = os.getenv("DAPR_MEMORY_STORE", DEFAULT_MEMORY_STORE)
     workflow_store = os.getenv("DAPR_WORKFLOW_STORE", DEFAULT_WORKFLOW_STORE)
 
-    # OTEL observability — follows the official demo-otel-k8s/instantiation pattern
-    endpoint = os.getenv(
-        "OTEL_EXPORTER_OTLP_ENDPOINT",
-        "http://otel-collector.observability.svc.cluster.local:4317",
+    # OTEL observability — rely on env vars only (validated by vanilla-durable-agent).
+    # Explicit AgentObservabilityConfig was creating a second TracerProvider that
+    # conflicted with the env-var-based auto-instrumentation. Env vars are set via
+    # ConfigMap openshell-durable-agent-otel-config.
+    logger.info(
+        "OTEL config: env-var mode (OTEL_SERVICE_NAME=%s, OTEL_EXPORTER_OTLP_ENDPOINT=%s)",
+        os.getenv("OTEL_SERVICE_NAME", "not-set"),
+        os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "not-set"),
     )
-    service_name = os.getenv("OTEL_SERVICE_NAME", "openshell-durable-agent")
 
-    observability = AgentObservabilityConfig(
-        enabled=True,
-        tracing_enabled=True,
-        tracing_exporter=AgentTracingExporter.OTLP_HTTP,
-        endpoint=endpoint,
-        service_name=service_name,
-    )
-    logger.info("OTEL config: endpoint=%s service=%s", endpoint, service_name)
-
-    return DurableAgent(
+    return OpenShellDurableAgent(
         name=agent_name,
         role="OpenShell Coding Agent",
         goal="Help users inspect, modify, and execute code safely inside an OpenShell sandbox.",
@@ -68,7 +99,7 @@ def create_durable_agent() -> DurableAgent:
         state=AgentStateConfig(
             store=StateStoreService(store_name=workflow_store),
         ),
-        agent_observability=observability,
+        # NO agent_observability — env vars handle OTEL setup (demo-otel-k8s/envvars pattern)
     )
 
 

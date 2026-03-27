@@ -1,14 +1,15 @@
 [project]
 name = "openshell-deep-agent"
 version = "0.1.0"
-description = "General-purpose deep agent using OpenShell as the on-prem sandbox provider"
+description = "OpenShell agent with native Dapr durable-agent and LangGraph+Dapr runtimes"
 requires-python = ">=3.12"
 dependencies = [
-    "deepagents>=0.4.11",
+    "dapr-agents==1.0.0",
+    "dapr-ext-langgraph==1.17.3",
     "langchain>=1.2.12",
-    "langchain-nvidia-ai-endpoints>=1.2.1",
-    "langgraph-cli[inmem]>=0.4.18",
+    "langgraph>=1.0.3",
     "openshell>=0.0.7",
+    "python-dotenv>=1.0.1",
 ]
 
 [tool.setuptools]

@@ -1,7 +1,7 @@
 {
   "dependencies": ["."],
   "graphs": {
-    "deepagent": "./src/agent.py:agent"
+    "openshell-dapr": "./src/langgraph_dapr_graph.py:graph"
   },
   "env": ".env"
 }
